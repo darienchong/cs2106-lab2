@@ -203,6 +203,19 @@ const char*** _split_sm_start_args(const char *processes[]) {
 	return res;
 }
 
+// Helper function that returns the length of a NULL-terminated array.
+// Includes the NULL at the end.
+// e.g. {"a", "b", NULL} -> 3
+int _get_length_of_null_terminated_array(const char *arr[]) {
+	int len = 0;
+	for (int i = 0; true; i++) {
+		const char *curr_str = arr[i];
+		if (arr[i] == NULL) {
+			return len + 1;
+		}
+		len++;
+	}
+}
 /**
  * Returns true if a process with the given pid is running, and false otherwise.
  * In theory this might be an issue if pid reuse occurs, but we're dealing with
@@ -250,46 +263,79 @@ void sm_free(void) {
 // Exercise 1a/2: start services
 // NEED TO CHANGE THIS FOR MULTI-PROCESS
 void sm_start(const char *(processes[])) {
+	// The number of processes in this service.
 	int number_of_processes = _get_num_of_processes_from_sm_start_args(processes);
+	
+	// An array of (array of process args). For easier processing.
 	char const **process_args = _split_sm_start_args(processes);
+	
+	// An array of process pids, for storing process information later.
+	int *process_pids[number_of_processes];
+	
+	// The process name. This will get overwritten until the last one,
+	// so it'll store the very last process's name.
+	char *process_name;
 
-	int child_pid = fork();
-	bool is_parent_process = child_pid > 0;
-	bool is_child_process = child_pid == 0;
-	bool is_fork_successful = child_pid >= 0;
+	// Iterate over the number of processes.
+	// Treat each one like a single process startup.
+	// Only difference is how we store process information.
+	// TODO: Add in piping
+	for (var i = 0; i < number_of_processes; i++) {
+		char const **current_process_args = process_args[i];
+		process_name = current_process_args[0];
+		
+		int child_pid = fork();
+		bool is_parent_process = child_pid > 0;
+		bool is_child_process = child_pid == 0;
+		bool is_fork_successful = child_pid >= 0;
 	
-	if(!is_fork_successful) {
-		printf("[%d][sm_start] Failed to fork child process.\n", getpid());
-		exit(1);
+		if(!is_fork_successful) {
+			printf("[%d][sm_start] Failed to fork child process.\n", getpid());
+			exit(1);
+		}
+		
+		if (is_parent_process) {
+			// Store the pids for later use.
+			pids[i] = child_pid;
+			return;
+		}
+		
+		if (is_child_process) {
+			execv(process_name, (char * const *) processes);
+		}
 	}
 	
-	if (is_parent_process) {
-		int process_pid = child_pid;
-		_store_process_information(process_pid, process_name);
-		return;
-	}
+	_store_process_information(pids, process_name, number_of_processes);
 	
-	if (is_child_process) {
-		execv(process_name, (char * const *) processes);
-	}
+	// TODO: Free process_args
 }
 
 // Exercise 1b: print service status
 size_t sm_status(sm_status_t statuses[]) {
 	for (int i = 0; i < current_service_number; i++) {
+		int process_pid = arr_pid[i][arr_num_of_processes[i]];
+		char *process_path = arr_path[i];
+		
+		// We include this short circuit here so that it returns false without
+		// a function call if our process has exited before.
+		bool is_there_a_process_with_this_pid_running = _is_process_running(process_pid);
+		bool is_process_running = (!arr_exited[i]) && is_there_a_process_with_this_pid_running;
+		
+		// Note to self: A possible pitfall is that between start and status, the process exits,
+		// and a new process with the same pid starts up (so we never find out the original process actually exited).
+		// then we could erroneously believe that "our" process is still running, when its pid was actually recycled
+		// to some other process. Is this a problem worth solving?
 		sm_status_t *current_status = &statuses[i];
 		
-		current_status -> pid = arr_pid[i];
-		current_status -> path = arr_path[i];
+		current_status -> pid = process_pid;
+		current_status -> path = process_path;
+		current_status -> running = is_process_running
 		
-		bool is_process_running = _is_process_running(arr_pid[i]);
 		
 		// Flag the process as terminated if we discovered that it is.
-		if (!is_process_running) {
+		if (!is_there_a_process_with_this_pid_running) {
 			arr_exited[i] = true;
 		}
-		
-		current_status -> running = is_process_running;
 	}
 	
 	return current_service_number;
