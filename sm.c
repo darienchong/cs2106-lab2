@@ -25,57 +25,48 @@ int *arr_pid[SM_MAX_SERVICES];
 // Used to keep track of array size.
 int arr_num_of_processes[SM_MAX_SERVICES];
 
-// Array of Strings
-// Each index corresponds to one service, and we only track
-// the last process path.
-char *arr_path[SM_MAX_SERVICES];
+// Array of (Array of paths)
+// Each index corresponds to one service, and we track
+// every process path.
+char **arr_path[SM_MAX_SERVICES];
 
 // Array of (Array of bools)
-// Each index corresponds to one service.
-// This is for Exercise 3, where we need to know if
-// a process has terminated; if so, we don't send a signal.
-// This tracks if a process has terminated.
+// Tracks whether the process at arr[service_idx][process_idx]
+// has exited or not.
+// This is necessary as we use waitpid() to track whether a child process
+// has exited or not. If it has, we flag it here and do not call waitpid() 
+// on that child anymore.
 bool *arr_exited[SM_MAX_SERVICES];
 
 // Stores the given pid at the given coordinates, essentially arr_pid[service_table_idx][process_table_idx].
-void _store_pid(int service_table_idx, int process_table_idx, int pid) {
-	int *service_array = arr_pid[service_table_idx];
-	service_array[process_table_idx] = pid;
+void _store_pid(int service_idx, int process_idx, int pid) {
+	arr_pid[service_idx][process_idx] = pid;
 }
 
 // Stores the path for the given service index.
 // Allocates enough memory for it as well.
-void _store_path(int service_idx, const char* path) {
-	arr_path[service_idx] = malloc((strlen(path) + 1) * sizeof(char));
-	if (arr_path[service_idx] == NULL) {
-		printf("[%d][_store_path] Failed to allocate memory in arr_path to store [%s].\n", getpid(), path);
+void _store_path(int service_idx, int process_idx, const char* path) {
+	arr_path[service_idx][process_idx] = malloc((strlen(path) + 1) * sizeof(char));
+	if (arr_path[service_idx][process_idx] == NULL) {
+		printf("[%d][_store_path] Failed to allocate memory in arr_path to store [%s] at [%d][%d].\n", getpid(), path, service_idx, process_idx);
 		exit(1);
 	}
-	strcpy(arr_path[service_idx], path);
+	strcpy(arr_path[service_idx][process_idx], path);
+}
+
+// Stores the number of processes initiated for the given service index.
+void _store_num_of_processes(int service_index, int num_of_processes) {
+	arr_num_of_processes[service_index] = num_of_processes;
 }
 
 /**
  * Stores the process information (process pid, path) into the arrays defined above.
  * For use when we're checking up on them.
- * num_of_processes should be at least 1.
+ * DOES NOT STORE THE NUMBER OF PROCESSES, THIS MUST BE DONE SEPARATELY.
  */
-void _store_process_information(int pids[], const char *path, int num_of_processes) {
-	// Short circuit
-	if (num_of_processes < 1) {
-		printf("[%d][_store_process_information] Number of processes given was 0. Returning from function.\n", getpid());
-		return;
-	}
-	
-	arr_num_of_processes[current_service_number] = num_of_processes;
-	
-	for (int i = 0; i < num_of_processes; i++) {
-		_store_pid(current_service_number, i, pids[i]);
-	}
-	
-	
-	_store_path(current_service_number, path);
-	
-	current_service_number++;
+void _store_process_information(int pid, const char *path, int service_index, int process_index) {
+	_store_pid(service_index, process_index, pid);
+	_store_path(service_index, process_index, path);
 	return;
 }
 
@@ -89,24 +80,23 @@ int _get_num_of_processes_from_sm_start_args(const char *processes[]) {
 	// we know we've reached the end of the array.
 	
 	int number_of_commands = 0;
-	bool is_previous_elt_was_null = false;
-	bool have_not_seen_double_null = false;
+	bool is_previous_elt_null = false;
 	for (int i = 0; true; i++) {
 		const char *current_string = processes[i];
-		if (is_previous_elt_was_null && current_string == NULL) {
+		if (is_previous_elt_null && current_string == NULL) {
 			// Reached end of array
 			return number_of_commands;
 		}
 		
 		if (current_string == NULL) {
-			is_previous_elt_was_null = true;
+			is_previous_elt_null = true;
 			number_of_commands++;
 			continue;
 		}
 		
 		// Reset the flag
 		if (current_string != NULL) {
-			is_previous_elt_was_null = false;
+			is_previous_elt_null = false;
 			continue;
 		}
 	}
@@ -149,8 +139,11 @@ const char*** _split_sm_start_args(const char *processes[]) {
 	int number_of_processes = _get_num_of_processes_from_sm_start_args(processes);
 	
 	// Buffer to hold stuff. We initialize it to the maximum size required
-	// (The length of the processes array).
+	// (The length of the processes array). We also zero out all the entries.
 	char *buf[processes_len];
+	for (int l = 0; l < processes_len; l++) {
+		buf[l] = NULL;
+	}
 	
 	// The array we are going to return.
 	const char ***res = malloc(sizeof(char*) * number_of_processes);
@@ -159,7 +152,7 @@ const char*** _split_sm_start_args(const char *processes[]) {
 	int current_process = 0;
 	
 	// Current number of arguments for our current process.
-	int current_number_of_args = 0;
+	int current_process_arg_count = 0;
 	
 	// Tracks the maximum number of slots used in buf[].
   	// We shall need this later to free buf[] properly.
@@ -174,32 +167,34 @@ const char*** _split_sm_start_args(const char *processes[]) {
 			// End of args
 			// Flush buffer to our result.
 			// We add one to account for the NULL at the end.
-			res[current_process] = malloc(sizeof(char*) * (current_number_of_args + 1));
-			for (int j = 0; j < current_number_of_args; j++) {
-        		res[current_process][j] = malloc(strlen(buf[j] + 1) * sizeof(char));
+			res[current_process] = malloc(sizeof(char*) * (current_process_arg_count + 1));
+			for (int j = 0; j < current_process_arg_count; j++) {
+        		res[current_process][j] = malloc((strlen(buf[j]) + 1) * sizeof(char));
 				strcpy((char *) res[current_process][j], buf[j]);
 			}
 			
-			res[current_process][current_number_of_args] = NULL;
+			res[current_process][current_process_arg_count] = NULL;
 			current_process++;
 
-      	if (current_number_of_args > highest_number_of_args) {
-        	highest_number_of_args = current_number_of_args;
-     	}
-			current_number_of_args = 0;
+      		if (current_process_arg_count > highest_number_of_args) {
+        		highest_number_of_args = current_process_arg_count;
+     		}
+			
+			
+			current_process_arg_count = 0;
 			continue;
-	}
+		}
 		
-    buf[current_number_of_args] = malloc((strlen(processes[i] + 1) * sizeof(char)));
-	strcpy(buf[current_number_of_args], processes[i]);
-    current_number_of_args++;
+		// We're going to be resizing this buffer as we need to, so we use realloc instead of malloc.
+    	buf[current_process_arg_count] = realloc(buf[current_process_arg_count], (strlen(processes[i]) + 1) * sizeof(char));
+		strcpy(buf[current_process_arg_count], processes[i]);
+    	current_process_arg_count++;
 	}
-	
-	// Don't forget to free the members of buf
-	// since we had to malloc for them.
-  	for (int k = 0; k < highest_number_of_args; k++) {
-    	free(buf[k]);
-  	}
+
+	// Free buf
+	for (int k = 0; k < highest_number_of_args; k++) {
+		free(buf[k]);
+	}
 	return res;
 }
 
@@ -209,20 +204,27 @@ const char*** _split_sm_start_args(const char *processes[]) {
 int _get_length_of_null_terminated_array(const char *arr[]) {
 	int len = 0;
 	for (int i = 0; true; i++) {
-		const char *curr_str = arr[i];
 		if (arr[i] == NULL) {
 			return len + 1;
 		}
 		len++;
 	}
 }
+
 /**
  * Returns true if a process with the given pid is running, and false otherwise.
  * In theory this might be an issue if pid reuse occurs, but we're dealing with
  * 32 processes in a system where the pid reuse occurs on wraparound (default 32768),
  * so that's 3 orders of magnitude off. We should be okay.
  */
-bool _is_process_running(int pid) {
+// TODO: Fix this to work with name and pid.
+bool _is_process_running(int pid, int service_idx, int process_idx) {
+	bool is_process_observed_terminated = arr_exited[service_idx][process_idx]; 
+	
+	if (is_process_observed_terminated) {
+		return false;
+	}
+	
 	int status;
 	pid_t return_pid = waitpid(pid, &status, WNOHANG);
 	
@@ -235,6 +237,7 @@ bool _is_process_running(int pid) {
 		return true;
 	} else if (return_pid == pid) {
 		// Stopped running
+		arr_exited[service_idx][process_idx] = true;
 		return false;
 	}
 	
@@ -242,12 +245,60 @@ bool _is_process_running(int pid) {
 	return false;
 }
 
+// Helper function for instantiating processes.
+// Forks, executes the given process over the child process.
+// Stores the information of the child process.
+// Note that storing should only be done by the parent process,
+// So this method should only ever be invoked by the parent.
+// Returns the PID of the child without waiting.
+
+// Params:
+// process_name: The name/path of the process to run.
+// args: The arguments, as an array of char*. Must be NULL-terminated.
+// service_index: The order of which the service was ran.
+//                e.g. the fifth service to run on the sm will have service_index of 4 (0-indexed).
+// process_index: The order of which the processes in the service were invoked.
+//                e.g. if a single service has three processes, they will be given the process indices of 0, 1, 2 respectively.
+int _run_process_and_store_information(const char *process_name, const char *args[], int service_index, int process_index) {
+	int child_pid = fork();
+	bool is_fork_successful = (child_pid >= 0);
+	bool is_parent = (child_pid > 0);
+	bool is_child = (child_pid == 0);
+	
+	if (!is_fork_successful) {
+		printf("[%d][_run_process_and_store_information]: Failed to fork process.\n", getpid());
+		exit(1);
+	}
+	
+	if (is_parent) {
+		_store_process_information(child_pid, process_name, service_index, process_index);
+		return child_pid;
+	}
+	
+	if (is_child) {
+		execv(process_name, (char * const * ) args);
+		
+		// We won't reach this if execv() executes correctly,
+		// but this prevents the child from hanging around otherwise.
+		exit(1);
+	}
+
+	// Again, we won't reach here ever, but to shut up the compiler...
+	return -1;
+}
+
 // Use this function to any initialisation if you need to.
 void sm_init(void) {
 	for (int i = 0; i < SM_MAX_SERVICES; i++) {
-		arr_pid[i] = malloc(sizeof(int) * 32);
-		arr_exited[i] = malloc(sizeof(bool) * 32);
-		arr_exited[i] = false;
+		arr_pid[i] = malloc(sizeof(int) * SM_MAX_SERVICES);
+		arr_path[i] = malloc(sizeof(char*) * SM_MAX_SERVICES);
+		arr_exited[i] = malloc(sizeof(bool) * SM_MAX_SERVICES);
+
+		// Initializing values.
+		for (int j = 0; j < SM_MAX_SERVICES; j++) {
+			arr_path[i][j] = NULL;
+			arr_exited[i][j] = false;
+		}
 	}
 }
 
@@ -255,8 +306,13 @@ void sm_init(void) {
 void sm_free(void) {
 	for (int i = 0; i < SM_MAX_SERVICES; i++) {
 		free(arr_pid[i]);
-		free(arr_path[i]);
+		
 		free(arr_exited[i]);
+		
+		for (int j = 0; j < SM_MAX_SERVICES; j++) {
+			free(arr_path[i][j]);
+		}
+		free(arr_path[i]);
 	}
 }
 
@@ -267,60 +323,52 @@ void sm_start(const char *(processes[])) {
 	int number_of_processes = _get_num_of_processes_from_sm_start_args(processes);
 	
 	// An array of (array of process args). For easier processing.
-	char const **process_args = _split_sm_start_args(processes);
-	
-	// An array of process pids, for storing process information later.
-	int *process_pids[number_of_processes];
-	
-	// The process name. This will get overwritten until the last one,
-	// so it'll store the very last process's name.
-	char *process_name;
+	char const ***process_args = _split_sm_start_args(processes);
 
 	// Iterate over the number of processes.
 	// Treat each one like a single process startup.
 	// Only difference is how we store process information.
 	// TODO: Add in piping
-	for (var i = 0; i < number_of_processes; i++) {
+	for (int i = 0; i < number_of_processes; i++) {
 		char const **current_process_args = process_args[i];
-		process_name = current_process_args[0];
-		
-		int child_pid = fork();
-		bool is_parent_process = child_pid > 0;
-		bool is_child_process = child_pid == 0;
-		bool is_fork_successful = child_pid >= 0;
-	
-		if(!is_fork_successful) {
-			printf("[%d][sm_start] Failed to fork child process.\n", getpid());
-			exit(1);
-		}
-		
-		if (is_parent_process) {
-			// Store the pids for later use.
-			pids[i] = child_pid;
-			return;
-		}
-		
-		if (is_child_process) {
-			execv(process_name, (char * const *) processes);
-		}
+		char const *current_process_name = current_process_args[0];
+		_run_process_and_store_information(current_process_name, current_process_args, current_service_number, i);
 	}
 	
-	_store_process_information(pids, process_name, number_of_processes);
+	// Storing the number of processes
+	_store_num_of_processes(current_service_number, number_of_processes);
 	
-	// TODO: Free process_args
+	// Free process_args
+	for (int j = 0; j < number_of_processes; j++) {
+		char const **current_process_args = process_args[j];
+		int current_process_args_len = _get_length_of_null_terminated_array(current_process_args);
+		for (int k = 0; k < current_process_args_len; k++) {
+			char const *current_process_arg = current_process_args[k];
+			if (current_process_arg == NULL) {
+				// No need to free a NULL pointer.
+				continue;
+			}
+			// Yes, it's not needed to cast it.
+			// But it silences a compiler warning.
+			// Why does that warning exist? I don't know.
+			free((void *) current_process_arg);
+		}
+		free(current_process_args);
+	}
+	free(process_args);
+	
+	current_service_number++;
 }
 
 // Exercise 1b: print service status
 size_t sm_status(sm_status_t statuses[]) {
 	for (int i = 0; i < current_service_number; i++) {
-		int process_pid = arr_pid[i][arr_num_of_processes[i]];
-		char *process_path = arr_path[i];
+		// Recall we use 0-indexing for both, so we need to subtract 1 from the number of processes (which is 1-indexed).
+		int process_pid = arr_pid[i][arr_num_of_processes[i] - 1];
+		char *process_path = arr_path[i][arr_num_of_processes[i] - 1];
 		
-		// We include this short circuit here so that it returns false without
-		// a function call if our process has exited before.
-		bool is_there_a_process_with_this_pid_running = _is_process_running(process_pid);
-		bool is_process_running = (!arr_exited[i]) && is_there_a_process_with_this_pid_running;
-		
+		bool is_process_running = _is_process_running(process_pid, i, arr_num_of_processes[i] - 1);
+
 		// Note to self: A possible pitfall is that between start and status, the process exits,
 		// and a new process with the same pid starts up (so we never find out the original process actually exited).
 		// then we could erroneously believe that "our" process is still running, when its pid was actually recycled
@@ -329,13 +377,7 @@ size_t sm_status(sm_status_t statuses[]) {
 		
 		current_status -> pid = process_pid;
 		current_status -> path = process_path;
-		current_status -> running = is_process_running
-		
-		
-		// Flag the process as terminated if we discovered that it is.
-		if (!is_there_a_process_with_this_pid_running) {
-			arr_exited[i] = true;
-		}
+		current_status -> running = is_process_running;
 	}
 	
 	return current_service_number;
