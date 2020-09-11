@@ -14,6 +14,10 @@
 #include <unistd.h>
 #include "sm.h"
 
+// For pipes
+#define READ_END 0
+#define WRITE_END 1
+
 int current_service_number = 0;
 
 // Array of (Array of PIDs)
@@ -212,12 +216,8 @@ int _get_length_of_null_terminated_array(const char *arr[]) {
 }
 
 /**
- * Returns true if a process with the given pid is running, and false otherwise.
- * In theory this might be an issue if pid reuse occurs, but we're dealing with
- * 32 processes in a system where the pid reuse occurs on wraparound (default 32768),
- * so that's 3 orders of magnitude off. We should be okay.
+ * Returns true if a child process with the given pid is running, and false otherwise.
  */
-// TODO: Fix this to work with name and pid.
 bool _is_process_running(int pid, int service_idx, int process_idx) {
 	bool is_process_observed_terminated = arr_exited[service_idx][process_idx]; 
 	
@@ -245,6 +245,38 @@ bool _is_process_running(int pid, int service_idx, int process_idx) {
 	return false;
 }
 
+// Sets the left pipe for the process calling this to the given pipe.
+// If the pipe given is NULL, then no pipe is set.
+void _set_pipe_read_from(int *pipe) {
+	if (pipe != NULL) {
+		// The process will now read in from pipe instead of stdin.
+		dup2(pipe[READ_END], STDIN_FILENO);
+
+		// Good practice to close the file descriptors
+		// now that we have a copy of it (dup2)
+		// Note that this won't close the write end of the pipe itself, since
+		// another open file descriptor (STDIN_FILENO) now refers to it.
+		close(pipe[READ_END]);
+		close(pipe[WRITE_END]);
+	}
+}
+
+// Set the right pipe for the process calling this to the given pipe.
+// If the pipe given is NULL, then no pipe is set.
+void _set_pipe_write_to(int *pipe) {
+	if (pipe != NULL) {
+		// The process will not write out to pipe instead of stdout.
+		dup2(pipe[WRITE_END], STDOUT_FILENO);
+
+		// Good practice to close the file descriptors
+		// now that we have a copy of it (dup2)
+		// Note that this won't close the write end of the pipe itself, since
+		// another open file descriptor (STDIN_FILENO) now refers to it.
+		close(pipe[READ_END]);
+		close(pipe[WRITE_END]);
+	}
+}
+
 // Helper function for instantiating processes.
 // Forks, executes the given process over the child process.
 // Stores the information of the child process.
@@ -255,11 +287,13 @@ bool _is_process_running(int pid, int service_idx, int process_idx) {
 // Params:
 // process_name: The name/path of the process to run.
 // args: The arguments, as an array of char*. Must be NULL-terminated.
+// left_pipe: The pipe that the child will read from. NULL if no pipe is to be attached.
+// right_pipe: The pipe that the child will write to. NULL if no pipe is to be attached.
 // service_index: The order of which the service was ran.
 //                e.g. the fifth service to run on the sm will have service_index of 4 (0-indexed).
 // process_index: The order of which the processes in the service were invoked.
 //                e.g. if a single service has three processes, they will be given the process indices of 0, 1, 2 respectively.
-int _run_process_and_store_information(const char *process_name, const char *args[], int service_index, int process_index) {
+int _run_process_and_store_information(const char *process_name, const char *args[], int *left_pipe, int *right_pipe, int service_index, int process_index) {
 	int child_pid = fork();
 	bool is_fork_successful = (child_pid >= 0);
 	bool is_parent = (child_pid > 0);
@@ -276,6 +310,9 @@ int _run_process_and_store_information(const char *process_name, const char *arg
 	}
 	
 	if (is_child) {
+		_set_pipe_read_from(left_pipe);
+		_set_pipe_write_to(right_pipe);
+
 		execv(process_name, (char * const * ) args);
 		
 		// We won't reach this if execv() executes correctly,
@@ -317,22 +354,75 @@ void sm_free(void) {
 }
 
 // Exercise 1a/2: start services
-// NEED TO CHANGE THIS FOR MULTI-PROCESS
 void sm_start(const char *(processes[])) {
 	// The number of processes in this service.
 	int number_of_processes = _get_num_of_processes_from_sm_start_args(processes);
 	
 	// An array of (array of process args). For easier processing.
 	char const ***process_args = _split_sm_start_args(processes);
+	
+	// Two pipes.
+	int left_pipe[2];
+	int right_pipe[2];
+	
+	// We initialise the first output pipe:
+	pipe(right_pipe);
 
-	// Iterate over the number of processes.
-	// Treat each one like a single process startup.
-	// Only difference is how we store process information.
-	// TODO: Add in piping
 	for (int i = 0; i < number_of_processes; i++) {
 		char const **current_process_args = process_args[i];
 		char const *current_process_name = current_process_args[0];
-		_run_process_and_store_information(current_process_name, current_process_args, current_service_number, i);
+		
+		// We need to connect the first child with the parent, so we handle it specially.
+		bool is_first_child = (i == 0);
+		bool is_last_child = (i == number_of_processes - 1);
+		bool is_only_child = is_first_child && is_last_child;
+
+		if (is_only_child) {
+			// Special case, we do no piping
+			_run_process_and_store_information(current_process_name, current_process_args, NULL, NULL, current_service_number, i);
+			continue;
+		}
+
+		if (is_first_child) {
+			// Special case, we don't alter the left pipe.
+			_run_process_and_store_information(current_process_name, current_process_args, NULL, right_pipe, current_service_number, i);
+
+			// We do a "relay" of moving the pipes over.
+			// This allows us to pipe the children into each other.
+			left_pipe[READ_END] = right_pipe[READ_END];
+			left_pipe[WRITE_END] = right_pipe[WRITE_END];
+			continue;
+		} 
+
+		if (is_last_child) {
+			// Special case, we don't alter the right pipe.
+			_run_process_and_store_information(current_process_name, current_process_args, left_pipe, NULL, current_service_number, i);
+
+			// We close these on the parent process since we won't be using them at all.
+			// These only facilitate child-child communication for later children.
+			close(left_pipe[READ_END]);
+			close(left_pipe[WRITE_END]);
+			continue;
+		}
+		
+		// Otherwise, we're a middle child (1 <= i < processes_len - 1)
+
+		// We make the next output pipe.
+		pipe(right_pipe);
+
+		// The previous output pipe (which is connected to the previous child's output) is now our left pipe, and connected
+		// to the input of our next child. The right pipe here is connected to the child's output, and will be what we use
+		// to pipe their output to the child after it.
+		_run_process_and_store_information(current_process_name, current_process_args, left_pipe, right_pipe, current_service_number, i);
+
+		// On the parent process, we close these file descriptors since we don't use them (we're not writing anything from parent to
+		// a middle child.
+		close(left_pipe[READ_END]);
+		close(left_pipe[WRITE_END]);
+
+		// Doing the relay again, see above.
+		left_pipe[READ_END] = right_pipe[READ_END];
+		left_pipe[WRITE_END] = right_pipe[WRITE_END];			
 	}
 	
 	// Storing the number of processes
@@ -357,6 +447,7 @@ void sm_start(const char *(processes[])) {
 	}
 	free(process_args);
 	
+	// Increment the counter so that we know how many services we have.
 	current_service_number++;
 }
 
@@ -366,13 +457,8 @@ size_t sm_status(sm_status_t statuses[]) {
 		// Recall we use 0-indexing for both, so we need to subtract 1 from the number of processes (which is 1-indexed).
 		int process_pid = arr_pid[i][arr_num_of_processes[i] - 1];
 		char *process_path = arr_path[i][arr_num_of_processes[i] - 1];
-		
 		bool is_process_running = _is_process_running(process_pid, i, arr_num_of_processes[i] - 1);
 
-		// Note to self: A possible pitfall is that between start and status, the process exits,
-		// and a new process with the same pid starts up (so we never find out the original process actually exited).
-		// then we could erroneously believe that "our" process is still running, when its pid was actually recycled
-		// to some other process. Is this a problem worth solving?
 		sm_status_t *current_status = &statuses[i];
 		
 		current_status -> pid = process_pid;
