@@ -6,11 +6,13 @@
  */
 
 #include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -22,7 +24,9 @@
 
 // Debug flag for debugging messages.
 bool debug = true;
-int current_service_number = 0;
+
+// Tracks how many services we have launched.
+int number_of_services_launched = 0;
 
 // Array of (Array of PIDs)
 // Each index corresponds to one service, but any one service
@@ -36,7 +40,7 @@ int arr_num_of_processes[SM_MAX_SERVICES];
 // Array of (Array of paths)
 // Each index corresponds to one service, and we track
 // every process path.
-char **arr_path[SM_MAX_SERVICES];
+char **arr_paths[SM_MAX_SERVICES];
 
 // Array of (Array of bools)
 // Tracks whether the process at arr[service_idx][process_idx]
@@ -54,14 +58,14 @@ void _store_pid(int service_idx, int process_idx, int pid) {
 // Stores the path for the given service index.
 // Allocates enough memory for it as well.
 void _store_path(int service_idx, int process_idx, const char* path) {
-	arr_path[service_idx][process_idx] = malloc((strlen(path) + 1) * sizeof(char));
-	if (arr_path[service_idx][process_idx] == NULL) {
+	arr_paths[service_idx][process_idx] = malloc((strlen(path) + 1) * sizeof(char));
+	if (arr_paths[service_idx][process_idx] == NULL) {
 		if (debug) {
-			printf("[%d][_store_path] Failed to allocate memory in arr_path to store [%s] at [%d][%d].\n", getpid(), path, service_idx, process_idx);
+			printf("[%d][_store_path] Failed to allocate memory in arr_paths to store [%s] at [%d][%d].\n", getpid(), path, service_idx, process_idx);
 		}
 		exit(1);
 	}
-	strcpy(arr_path[service_idx][process_idx], path);
+	strcpy(arr_paths[service_idx][process_idx], path);
 }
 
 // Stores the number of processes initiated for the given service index.
@@ -315,7 +319,7 @@ void _set_pipe_write_to(int *pipe) {
 // Stores the information of the child process.
 // Note that storing should only be done by the parent process,
 // So this method should only ever be invoked by the parent.
-// Returns the PID of the child without waiting.
+// Returns the child's PID.
 
 // Params:
 // process_name: The name/path of the process to run.
@@ -326,7 +330,8 @@ void _set_pipe_write_to(int *pipe) {
 //                e.g. the fifth service to run on the sm will have service_index of 4 (0-indexed).
 // process_index: The order of which the processes in the service were invoked.
 //                e.g. if a single service has three processes, they will be given the process indices of 0, 1, 2 respectively.
-int _run_process_and_store_information(const char *process_name, const char *args[], int *left_pipe, int *right_pipe, int service_index, int process_index) {
+// is_log_enabled: Boolean flag. If enabled, we redirect stderr to stdout, and redirect stdout to a file named service{service_index}.log.
+int _run_process_and_store_information(const char *process_name, const char *args[], int *left_pipe, int *right_pipe, int service_index, int process_index, bool is_log_enabled) {
 	int child_pid = fork();
 	bool is_fork_successful = (child_pid >= 0);
 	bool is_parent = (child_pid > 0);
@@ -342,11 +347,45 @@ int _run_process_and_store_information(const char *process_name, const char *arg
 	if (is_parent) {
 		_store_process_information(child_pid, process_name, service_index, process_index);
 		return child_pid;
+		
 	}
 	
 	if (is_child) {
 		_set_pipe_read_from(left_pipe);
 		_set_pipe_write_to(right_pipe);
+		
+		if (is_log_enabled) {
+			// We allocate enough space for "service.log" up to two digits, and the NULL terminator.
+			// We know two digits is enough, since we will only work with up to 32 services.
+			char log_filename[(strlen("service.log") + 2 + 1) * sizeof(char)];
+			sprintf(log_filename, "service%d.log", service_index);
+			FILE *log_file_pointer = fopen(log_filename, "a");
+
+			if (log_file_pointer == NULL) {
+				if (debug) {
+					printf("[%d][_run_process_and_store_information] Failed to open/create %s.\n", getpid(), log_filename);
+					exit(1);
+				}
+			}
+
+			dup2(fileno(log_file_pointer), STDOUT_FILENO);
+			dup2(fileno(log_file_pointer), STDERR_FILENO);
+			fclose(log_file_pointer);
+
+			/*
+			int fd = open(log_filename, O_CREAT | O_APPEND, S_IRWXU | S_IRWXG | S_IRWXO);
+
+			if (fd == 1) {
+				if (debug) {
+					printf("[%d][_run_process_and_store_information] Failed to open/create %s.\n", getpid(), log_filename);
+				}
+			}
+			
+			dup2(fd, fileno(stdout));
+			dup2(fd, STDERR_FILENO);
+			close(fd);
+			*/
+		}
 
 		execv(process_name, (char * const * ) args);
 		
@@ -359,16 +398,41 @@ int _run_process_and_store_information(const char *process_name, const char *arg
 	return -1;
 }
 
+// Sends a SIGTERM signal to the targeted process, if it is running.
+void _terminate_process(int process_pid, int service_index, int process_index) {
+	bool is_process_running = _is_process_running(process_pid, service_index, process_index);
+	if (is_process_running) {
+		kill(process_pid, SIGTERM);
+	}
+}
+
+// Waits for the given process.
+// If it is terminated, then this process returns immediately.
+void _wait_for_process(int process_pid, int service_index, int process_index) {
+	bool is_process_running = _is_process_running(process_pid, service_index, process_index);
+	if (is_process_running) {
+		// We only care about waiting for it to terminate, we don't need any options not do we care about
+		// the exit code, hence the parameters NULL (for the exit code variable) and 0 (for options).
+		int wait_status;
+		int returned_pid = waitpid(process_pid, &wait_status, 0);
+		if (returned_pid == -1) {
+			if (debug) {
+				printf("[%d][_wait_for_process] waitpid(%d, NULL, 0) call failed.\n", getpid(), process_pid);
+			}
+		}
+		arr_exited[service_index][process_index] = true;
+	}
+}
+
 // Use this function to any initialisation if you need to.
 void sm_init(void) {
 	for (int i = 0; i < SM_MAX_SERVICES; i++) {
 		arr_pids[i] = malloc(sizeof(int) * SM_MAX_SERVICES);
-		arr_path[i] = malloc(sizeof(char*) * SM_MAX_SERVICES);
+		arr_paths[i] = malloc(sizeof(char*) * SM_MAX_SERVICES);
 		arr_exited[i] = malloc(sizeof(bool) * SM_MAX_SERVICES);
 
-		// Initializing values.
 		for (int j = 0; j < SM_MAX_SERVICES; j++) {
-			arr_path[i][j] = NULL;
+			arr_paths[i][j] = NULL;
 			arr_exited[i][j] = false;
 		}
 	}
@@ -382,21 +446,27 @@ void sm_free(void) {
 		free(arr_exited[i]);
 		
 		for (int j = 0; j < SM_MAX_SERVICES; j++) {
-			free(arr_path[i][j]);
+			free(arr_paths[i][j]);
 		}
-		free(arr_path[i]);
+		free(arr_paths[i]);
 	}
 }
 
-// Exercise 1a/2: start services
-void sm_start(const char *(processes[])) {
+// Starts all the processes as indicated in processes[].
+// If the log flag is set to true, then it will redirect
+// the last process's output to a file named "serviceN.log", where N
+// is the number of services launched. The output will be appended to the file.
+void _start_processes(const char *processes[], bool is_log_enabled) {
 	// The number of processes in this service.
 	int number_of_processes = _get_num_of_processes_from_sm_start_args(processes);
 	
 	// An array of (array of process args). For easier processing.
 	char const ***process_args = _split_sm_start_args(processes);
 	
-	// Two pipes.
+	// Left and right pipe.
+	// We use the right pipe during forking for IPC.
+	// The left pipe serves as a temp variable to hold the right pipe
+	// between creating more child processes.
 	int left_pipe[2];
 	int right_pipe[2];
 	
@@ -414,13 +484,29 @@ void sm_start(const char *(processes[])) {
 
 		if (is_only_child) {
 			// Special case, we do no piping
-			_run_process_and_store_information(current_process_name, current_process_args, NULL, NULL, current_service_number, i);
+			_run_process_and_store_information(
+				current_process_name, 
+				current_process_args,
+				NULL, // The left pipe to use. Since this is the only process, we don't need to redirect input.
+				NULL, // The right pipe to use.
+				number_of_services_launched, // The service index to use.
+				i, // The process index to use.
+				is_log_enabled // Flag to en/disable log.
+			);
 			continue;
 		}
 
 		if (is_first_child) {
 			// Special case, we don't alter the left pipe.
-			_run_process_and_store_information(current_process_name, current_process_args, NULL, right_pipe, current_service_number, i);
+			_run_process_and_store_information(
+				current_process_name,
+				current_process_args,
+				NULL,
+				right_pipe,
+				number_of_services_launched,
+				i,
+				false
+			);
 
 			// We do a "relay" of moving the pipes over.
 			// This allows us to pipe the children into each other.
@@ -431,7 +517,15 @@ void sm_start(const char *(processes[])) {
 
 		if (is_last_child) {
 			// Special case, we don't alter the right pipe.
-			_run_process_and_store_information(current_process_name, current_process_args, left_pipe, NULL, current_service_number, i);
+			_run_process_and_store_information(
+				current_process_name,
+				current_process_args,
+				left_pipe,
+				NULL,
+				number_of_services_launched,
+				i,
+				is_log_enabled
+			);
 
 			// We close these on the parent process since we won't be using them at all.
 			// These only facilitate child-child communication for later children.
@@ -448,7 +542,15 @@ void sm_start(const char *(processes[])) {
 		// The previous output pipe (which is connected to the previous child's output) is now our left pipe, and connected
 		// to the input of our next child. The right pipe here is connected to the child's output, and will be what we use
 		// to pipe their output to the child after it.
-		_run_process_and_store_information(current_process_name, current_process_args, left_pipe, right_pipe, current_service_number, i);
+		_run_process_and_store_information(
+			current_process_name,
+			current_process_args,
+			left_pipe,
+			right_pipe,
+			number_of_services_launched,
+			i,
+			false
+		);
 
 		// On the parent process, we close these file descriptors since we don't use them (we're not writing anything from parent to
 		// a middle child.
@@ -461,7 +563,7 @@ void sm_start(const char *(processes[])) {
 	}
 	
 	// Storing the number of processes
-	_store_num_of_processes(current_service_number, number_of_processes);
+	_store_num_of_processes(number_of_services_launched, number_of_processes);
 	
 	// Free process_args
 	for (int j = 0; j < number_of_processes; j++) {
@@ -483,15 +585,20 @@ void sm_start(const char *(processes[])) {
 	free(process_args);
 	
 	// Increment the counter so that we know how many services we have.
-	current_service_number++;
+	number_of_services_launched++;
+}
+
+// Exercise 1a/2: start services
+void sm_start(const char *(processes[])) {
+	_start_processes(processes, false);
 }
 
 // Exercise 1b: print service status
 size_t sm_status(sm_status_t statuses[]) {
-	for (int i = 0; i < current_service_number; i++) {
+	for (int i = 0; i < number_of_services_launched; i++) {
 		// Recall we use 0-indexing for both, so we need to subtract 1 from the number of processes (which is 1-indexed).
 		int process_pid = arr_pids[i][arr_num_of_processes[i] - 1];
-		char *process_path = arr_path[i][arr_num_of_processes[i] - 1];
+		char *process_path = arr_paths[i][arr_num_of_processes[i] - 1];
 		bool is_process_running = _is_process_running(process_pid, i, arr_num_of_processes[i] - 1);
 
 		sm_status_t *current_status = &statuses[i];
@@ -501,7 +608,7 @@ size_t sm_status(sm_status_t statuses[]) {
 		current_status -> running = is_process_running;
 	}
 	
-	return current_service_number;
+	return number_of_services_launched;
 }
 
 // Exercise 3: stop service, wait on service, and shutdown
@@ -513,27 +620,13 @@ void sm_stop(size_t index) {
 	// Send a SIGTERM signal to all running processes in this service.
 	for (int process_index = 0; process_index < num_of_processes; process_index++) {
 		int current_process_pid = pids[process_index];
-		bool is_process_running = _is_process_running(current_process_pid, service_index, process_index);
-		if (is_process_running) {
-			kill(current_process_pid, SIGTERM);
-		}
+		_terminate_process(current_process_pid, service_index, process_index);
 	}
 	
 	// Wait for any non-terminated processes.
 	for (int process_index_ = 0; process_index_ < num_of_processes; process_index_++) {
 		int current_process_pid = pids[process_index_];
-		bool is_process_running = _is_process_running(current_process_pid, service_index, process_index_);
-		if (is_process_running) {
-			// We only care about waiting for it to terminate, we don't need any options not do we care about
-			// the exit code, hence the parameters NULL (for the exit code variable) and 0 (for options).
-			int wait_status;
-			int returned_pid = waitpid(current_process_pid, &wait_status, 0);
-			if (returned_pid == -1) {
-				if (debug) {
-					printf("[%d][sm_stop] waitpid(%d, NULL, 0) call failed.\n", getpid(), current_process_pid);
-				}
-			}
-		}
+		_wait_for_process(current_process_pid, service_index, process_index_);
 	}
 }
 
@@ -541,28 +634,22 @@ void sm_wait(size_t index) {
 	int service_index = index;
 	int num_of_processes = arr_num_of_processes[index];
 	int *pids = arr_pids[index];
+
 	for (int process_index = 0; process_index < num_of_processes; process_index++) {
 		int current_process_pid = pids[process_index];
-		bool is_process_running = _is_process_running(current_process_pid, service_index, process_index);
-		if (is_process_running) {
-			int wait_status;
-			waitpid(current_process_pid, &wait_status, 0);
-			arr_exited[service_index][process_index] = true;
-			if (wait_status == -1) {
-				printf("[%d][sm_wait] waitpid(%d, NULL, 0) call failed.\n", getpid(), current_process_pid);
-			} 
-		}
+		_wait_for_process(current_process_pid, service_index, process_index);
 	}
 }
 
 void sm_shutdown(void) {
-	for (int service_index = 0; service_index < current_service_number; service_index++) {
+	for (int service_index = 0; service_index < number_of_services_launched; service_index++) {
 		sm_stop(service_index);
 	}
 }
 
 // Exercise 4: start with output redirection
 void sm_startlog(const char *processes[]) {
+	_start_processes(processes, true);
 }
 
 // Exercise 5: show log file
