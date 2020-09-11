@@ -5,6 +5,8 @@
  * this file.
  */
 
+#include <errno.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,12 +20,14 @@
 #define READ_END 0
 #define WRITE_END 1
 
+// Debug flag for debugging messages.
+bool debug = true;
 int current_service_number = 0;
 
 // Array of (Array of PIDs)
 // Each index corresponds to one service, but any one service
 // might have more than one associated PID (since multiple processes might launch)
-int *arr_pid[SM_MAX_SERVICES];
+int *arr_pids[SM_MAX_SERVICES];
 
 // Each index corresponds to the number of processes for this service.
 // Used to keep track of array size.
@@ -42,9 +46,9 @@ char **arr_path[SM_MAX_SERVICES];
 // on that child anymore.
 bool *arr_exited[SM_MAX_SERVICES];
 
-// Stores the given pid at the given coordinates, essentially arr_pid[service_table_idx][process_table_idx].
+// Stores the given pid at the given coordinates, essentially arr_pids[service_table_idx][process_table_idx].
 void _store_pid(int service_idx, int process_idx, int pid) {
-	arr_pid[service_idx][process_idx] = pid;
+	arr_pids[service_idx][process_idx] = pid;
 }
 
 // Stores the path for the given service index.
@@ -52,7 +56,9 @@ void _store_pid(int service_idx, int process_idx, int pid) {
 void _store_path(int service_idx, int process_idx, const char* path) {
 	arr_path[service_idx][process_idx] = malloc((strlen(path) + 1) * sizeof(char));
 	if (arr_path[service_idx][process_idx] == NULL) {
-		printf("[%d][_store_path] Failed to allocate memory in arr_path to store [%s] at [%d][%d].\n", getpid(), path, service_idx, process_idx);
+		if (debug) {
+			printf("[%d][_store_path] Failed to allocate memory in arr_path to store [%s] at [%d][%d].\n", getpid(), path, service_idx, process_idx);
+		}
 		exit(1);
 	}
 	strcpy(arr_path[service_idx][process_idx], path);
@@ -229,8 +235,35 @@ bool _is_process_running(int pid, int service_idx, int process_idx) {
 	pid_t return_pid = waitpid(pid, &status, WNOHANG);
 	
 	if (return_pid == -1) {
-		// Error
-		printf("[%d][_is_process_running] waitpid(%d, &status, WNOHANG) call failed.\n", getpid(), pid);
+		// waitpid has reported an error.
+		bool is_errno_ECHILD = (errno == ECHILD);
+		bool is_errno_EINTR = (errno == EINTR);
+		bool is_errno_EINVAL = (errno == EINVAL);
+
+		if (debug) {
+			printf("[%d][_is_process_running] waitpid(%d, &status, WNOHANG) call failed.\n", getpid(), pid);
+			
+			if (is_errno_ECHILD) {
+				printf("[%d][_is_process_running] errno = ECHILD\n", getpid());
+			}
+			
+			if (is_errno_EINTR) {
+				printf("[%d][_is_process_running] errno = EINTR\n", getpid());
+			}
+	
+			if (is_errno_EINVAL) {
+				printf("[%d][_is_process_running] errno = EINVAL\n", getpid());
+			}
+			
+			printf("[%d][_is_process_running] WIFEXITED(status) = %d\n", getpid(), WIFEXITED(status));
+			printf("[%d][_is_process_running] WEXITSTATUS(status) = %d\n", getpid(), WEXITSTATUS(status));
+			printf("[%d][_is_process_running] WIFSIGNALED(status) = %d\n", getpid(), WIFSIGNALED(status));
+	
+			if (WIFSIGNALED(status)) {
+				printf("[%d][_is_process_running] WTERMSIG(status) = %d\n", getpid(), WTERMSIG(status));
+			}
+		}
+		
 		exit(1);
 	} else if (return_pid == 0) {
 		// Still running
@@ -300,7 +333,9 @@ int _run_process_and_store_information(const char *process_name, const char *arg
 	bool is_child = (child_pid == 0);
 	
 	if (!is_fork_successful) {
-		printf("[%d][_run_process_and_store_information]: Failed to fork process.\n", getpid());
+		if (debug) {
+			printf("[%d][_run_process_and_store_information]: Failed to fork process.\n", getpid());
+		}
 		exit(1);
 	}
 	
@@ -327,7 +362,7 @@ int _run_process_and_store_information(const char *process_name, const char *arg
 // Use this function to any initialisation if you need to.
 void sm_init(void) {
 	for (int i = 0; i < SM_MAX_SERVICES; i++) {
-		arr_pid[i] = malloc(sizeof(int) * SM_MAX_SERVICES);
+		arr_pids[i] = malloc(sizeof(int) * SM_MAX_SERVICES);
 		arr_path[i] = malloc(sizeof(char*) * SM_MAX_SERVICES);
 		arr_exited[i] = malloc(sizeof(bool) * SM_MAX_SERVICES);
 
@@ -342,7 +377,7 @@ void sm_init(void) {
 // Use this function to do any cleanup of resources.
 void sm_free(void) {
 	for (int i = 0; i < SM_MAX_SERVICES; i++) {
-		free(arr_pid[i]);
+		free(arr_pids[i]);
 		
 		free(arr_exited[i]);
 		
@@ -455,7 +490,7 @@ void sm_start(const char *(processes[])) {
 size_t sm_status(sm_status_t statuses[]) {
 	for (int i = 0; i < current_service_number; i++) {
 		// Recall we use 0-indexing for both, so we need to subtract 1 from the number of processes (which is 1-indexed).
-		int process_pid = arr_pid[i][arr_num_of_processes[i] - 1];
+		int process_pid = arr_pids[i][arr_num_of_processes[i] - 1];
 		char *process_path = arr_path[i][arr_num_of_processes[i] - 1];
 		bool is_process_running = _is_process_running(process_pid, i, arr_num_of_processes[i] - 1);
 
@@ -471,12 +506,59 @@ size_t sm_status(sm_status_t statuses[]) {
 
 // Exercise 3: stop service, wait on service, and shutdown
 void sm_stop(size_t index) {
+	int service_index = index;
+	int num_of_processes = arr_num_of_processes[index];
+	int *pids = arr_pids[index];
+	
+	// Send a SIGTERM signal to all running processes in this service.
+	for (int process_index = 0; process_index < num_of_processes; process_index++) {
+		int current_process_pid = pids[process_index];
+		bool is_process_running = _is_process_running(current_process_pid, service_index, process_index);
+		if (is_process_running) {
+			kill(current_process_pid, SIGTERM);
+		}
+	}
+	
+	// Wait for any non-terminated processes.
+	for (int process_index_ = 0; process_index_ < num_of_processes; process_index_++) {
+		int current_process_pid = pids[process_index_];
+		bool is_process_running = _is_process_running(current_process_pid, service_index, process_index_);
+		if (is_process_running) {
+			// We only care about waiting for it to terminate, we don't need any options not do we care about
+			// the exit code, hence the parameters NULL (for the exit code variable) and 0 (for options).
+			int wait_status;
+			int returned_pid = waitpid(current_process_pid, &wait_status, 0);
+			if (returned_pid == -1) {
+				if (debug) {
+					printf("[%d][sm_stop] waitpid(%d, NULL, 0) call failed.\n", getpid(), current_process_pid);
+				}
+			}
+		}
+	}
 }
 
 void sm_wait(size_t index) {
+	int service_index = index;
+	int num_of_processes = arr_num_of_processes[index];
+	int *pids = arr_pids[index];
+	for (int process_index = 0; process_index < num_of_processes; process_index++) {
+		int current_process_pid = pids[process_index];
+		bool is_process_running = _is_process_running(current_process_pid, service_index, process_index);
+		if (is_process_running) {
+			int wait_status;
+			waitpid(current_process_pid, &wait_status, 0);
+			arr_exited[service_index][process_index] = true;
+			if (wait_status == -1) {
+				printf("[%d][sm_wait] waitpid(%d, NULL, 0) call failed.\n", getpid(), current_process_pid);
+			} 
+		}
+	}
 }
 
 void sm_shutdown(void) {
+	for (int service_index = 0; service_index < current_service_number; service_index++) {
+		sm_stop(service_index);
+	}
 }
 
 // Exercise 4: start with output redirection
