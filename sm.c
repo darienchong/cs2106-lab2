@@ -588,6 +588,18 @@ void _start_processes(const char *processes[], bool is_log_enabled) {
 	number_of_services_launched++;
 }
 
+// Returns false if a file with this name does not exist.
+// Returns true otherwise.
+// Note that this means it may return true in the case where
+// we fail to open the file, but for reasons other than "the file does not exist".
+bool _does_file_exist(char *filename) {
+	FILE *fp = fopen(filename, "r");
+	if (fp == NULL && errno == ENOENT) {
+		return false;
+	}
+	fclose(fp);
+	return true;
+}
 // Exercise 1a/2: start services
 void sm_start(const char *(processes[])) {
 	_start_processes(processes, false);
@@ -654,4 +666,34 @@ void sm_startlog(const char *processes[]) {
 
 // Exercise 5: show log file
 void sm_showlog(size_t index) {
+	// Ideally, I wouldn't have to replicate this code from the earlier portion.
+	// But extracting this into a function means I have to malloc for it.
+	// That's more of a hassle than just redeclaring it here.
+	// Admittedly if this were an enterprise setting and I was facing
+	// having to potentially refactor the log filenames...
+	char log_filename[(strlen("service.log") + 2 + 1) * sizeof(char)];
+	sprintf(log_filename, "service%d.log", (int) index);
+	bool is_log_file_exists = _does_file_exist(log_filename);
+
+	if (!is_log_file_exists) {
+		printf("service has no log file");
+		return;
+	}
+
+	FILE *log_file_pointer = fopen(log_filename, "r");
+	char c; // Yes, we're going to read the file one character at a time.
+	if (log_file_pointer == NULL) {
+		if (debug) {
+			printf("[%d][sm_showlog] Failed to open log file.\n", getpid());
+		}
+		exit(1);
+	}
+
+	c = fgetc(log_file_pointer);
+	while (c != EOF) {
+		printf("%c", c);
+		c = fgetc(log_file_pointer);
+	}
+	fclose(log_file_pointer);
+	return;
 }
